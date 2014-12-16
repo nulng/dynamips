@@ -23,10 +23,12 @@
 #include "ppc32_exec.h"
 #include "ppc32_jit.h"
 
+#include "gdb_proto.h"
+
 /* Reset a PowerPC CPU */
 int ppc32_reset(cpu_ppc_t *cpu)
 {
-   cpu->ia = PPC32_ROM_START;
+   cpu->ia_prev = cpu->ia = PPC32_ROM_START;
    cpu->gpr[1] = PPC32_ROM_SP;
    cpu->msr = PPC32_MSR_IP;
 
@@ -229,7 +231,7 @@ int ppc32_get_idling_pc(cpu_gen_t *cpu)
          printf("   0x%llx (count=%u)\n",
                 cpu->idle_pc_prop[i].pc,
                 cpu->idle_pc_prop[i].count);
-      }         
+      }
 
       printf("Restart the emulator with \"--idle-pc=0x%llx\" (for example)\n",
              cpu->idle_pc_prop[0].pc);
@@ -247,7 +249,7 @@ int ppc32_get_idling_pc(cpu_gen_t *cpu)
                res->count = p->count;
             }
          }
-       
+
       printf("\n");
    }
 
@@ -288,12 +290,35 @@ void ppc32_vm_clear_irq(vm_instance_t *vm,u_int irq)
 /* Generate an exception */
 void ppc32_trigger_exception(cpu_ppc_t *cpu,u_int exc_vector)
 {
-   //printf("TRIGGER_EXCEPTION: saving cpu->ia=0x%8.8x, msr=0x%8.8x\n",
-   //       cpu->ia,cpu->msr);
+//    printf("TRIGGER_EXCEPTION: saving cpu->ia=0x%8.8x, msr=0x%8.8x\n",
+//          cpu->ia,cpu->msr);
+
+   /* First check if a GDB session is present so it can handle the exception */
+   switch (exc_vector)
+   {
+        //case PPC32_EXC_SYS_RST:   /* System Reset */
+        //case PPC32_EXC_MC_CHK:    /* Machine Check */
+        case PPC32_EXC_DSI:       /* Data memory access failure */
+        case PPC32_EXC_ISI:       /* Instruction fetch failure */
+        //case PPC32_EXC_EXT:       /* External Interrupt */
+        case PPC32_EXC_ALIGN:     /* Alignment */
+        case PPC32_EXC_PROG:      /* FPU, Illegal instruction, ... */
+        //case PPC32_EXC_NO_FPU:    /* FPU unavailable */
+        //case PPC32_EXC_DEC:       /* Decrementer */
+        //case PPC32_EXC_SYSCALL:   /* System Call */
+        case PPC32_EXC_TRACE:     /* Trace */
+        //case PPC32_EXC_FPU_HLP:   /* Floating-Point Assist */
+        if (cpu->vm->gdb_server_running == TRUE)
+        {
+                cpu->vm->gdb_ctx->signal = GDB_SIGINT;
+                vm_suspend(cpu->vm);
+                return;
+        }
+   }
 
    /* Save the return instruction address */
    cpu->srr0 = cpu->ia;
-   
+
    if (exc_vector == PPC32_EXC_SYSCALL)
       cpu->srr0 += sizeof(ppc_insn_t);
 
@@ -312,7 +337,10 @@ void ppc32_trigger_exception(cpu_ppc_t *cpu,u_int exc_vector)
 
    /* Use bootstrap vectors ? */
    if (cpu->msr & PPC32_MSR_IP)
+   {
+      //printf("[-] Exception at IP 0x%8.8x\n", exc_vector);
       cpu->ia = 0xFFF00000 + exc_vector;
+   }
    else
       cpu->ia = exc_vector;
 }
@@ -357,6 +385,22 @@ fastcall void ppc32_run_breakpoint(cpu_ppc_t *cpu)
    ppc32_dump_regs(cpu->gen);
 }
 
+/* Check if current EPC has a breakpoint set */
+int ppc32_is_breakpoint_at_pc(cpu_ppc_t *cpu)
+{
+   m_uint64_t pc = cpu->ia;
+   int i;
+
+   for(i=0; i < PPC32_MAX_BREAKPOINTS; i++)
+   {
+      if (pc == cpu->breakpoints[i]) {
+         return TRUE;
+      }
+   }
+
+   return FALSE;
+}
+
 /* Add a virtual breakpoint */
 int ppc32_add_breakpoint(cpu_gen_t *cpu,m_uint64_t ia)
 {
@@ -377,13 +421,15 @@ int ppc32_add_breakpoint(cpu_gen_t *cpu,m_uint64_t ia)
 
 /* Remove a virtual breakpoint */
 void ppc32_remove_breakpoint(cpu_gen_t *cpu,m_uint64_t ia)
-{   
+{
    cpu_ppc_t *pcpu = CPU_PPC32(cpu);
    int i,j;
 
+   //printf("About to check breakpoints list to remove bp at 0x%llx\n", ia);
    for(i=0;i<PPC32_MAX_BREAKPOINTS;i++)
-      if (pcpu->breakpoints[i] == ia)
+      if (pcpu->breakpoints[i] == (m_uint32_t)ia)
       {
+         //printf ("--->bp found at index %d\n", i);
          for(j=i;j<PPC32_MAX_BREAKPOINTS-1;j++)
             pcpu->breakpoints[j] = pcpu->breakpoints[j+1];
 
@@ -406,10 +452,10 @@ void ppc32_reg_set(cpu_gen_t *cpu,u_int reg,m_uint64_t val)
 
 /* Dump registers of a PowerPC processor */
 void ppc32_dump_regs(cpu_gen_t *cpu)
-{ 
+{
    cpu_ppc_t *pcpu = CPU_PPC32(cpu);
    int i;
-   
+
    printf("PowerPC Registers:\n");
 
    for(i=0;i<PPC32_GPR_NR/4;i++) {
@@ -421,9 +467,9 @@ void ppc32_dump_regs(cpu_gen_t *cpu)
 
    printf("\n");
    printf("  ia = 0x%8.8x, lr = 0x%8.8x\n", pcpu->ia, pcpu->lr);
-   printf("  cr = 0x%8.8x, msr = 0x%8.8x, xer = 0x%8.8x, dec = 0x%8.8x\n", 
-          ppc32_get_cr(pcpu), pcpu->msr, 
-          pcpu->xer | (pcpu->xer_ca << PPC32_XER_CA_BIT), 
+   printf("  cr = 0x%8.8x, msr = 0x%8.8x, xer = 0x%8.8x, dec = 0x%8.8x\n",
+          ppc32_get_cr(pcpu), pcpu->msr,
+          pcpu->xer | (pcpu->xer_ca << PPC32_XER_CA_BIT),
           pcpu->dec);
 
    printf("  sprg[0] = 0x%8.8x, sprg[1] = 0x%8.8x\n",
@@ -478,7 +524,7 @@ void ppc32_dump_mmu(cpu_gen_t *cpu)
 
 /* Load a raw image into the simulated memory */
 int ppc32_load_raw_image(cpu_ppc_t *cpu,char *filename,m_uint32_t vaddr)
-{   
+{
    struct stat file_info;
    size_t len,clen;
    m_uint32_t remain;
@@ -503,7 +549,7 @@ int ppc32_load_raw_image(cpu_ppc_t *cpu,char *filename,m_uint32_t vaddr)
    while(len > 0)
    {
       haddr = cpu->mem_op_lookup(cpu,vaddr,PPC32_MTS_DCACHE);
-   
+
       if (!haddr) {
          fprintf(stderr,"load_raw_image: invalid load address 0x%8.8x\n",
                  vaddr);
@@ -517,16 +563,16 @@ int ppc32_load_raw_image(cpu_ppc_t *cpu,char *filename,m_uint32_t vaddr)
 
       remain = MIPS_MIN_PAGE_SIZE;
       remain -= (vaddr - (vaddr & MIPS_MIN_PAGE_MASK));
-      
+
       clen = m_min(clen,remain);
 
       if (fread((u_char *)haddr,clen,1,bfd) != 1)
          break;
-      
+
       vaddr += clen;
       len -= clen;
    }
-   
+
    fclose(bfd);
    return(0);
 }
@@ -602,7 +648,7 @@ int ppc32_load_elf_image(cpu_ppc_t *cpu,char *filename,int skip_load,
             printf("   * Adding section at virtual address 0x%8.8x "
                    "(len=0x%8.8lx)\n",vaddr,(u_long)len);
          }
-         
+
          while(len > 0)
          {
             haddr = cpu->mem_op_lookup(cpu,vaddr,PPC32_MTS_DCACHE);

@@ -1,0 +1,12 @@
+[localhost]
+[[7200]]
+
+image = c7200-adventerprisek9-mz.152-4.S5.bin.unpacked
+npe = npe-400
+ram = 160
+
+[[ROUTER R1]]
+
+s1/0 = R2 s1/0
+
+[[router R2]]
